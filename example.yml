@@ -1,0 +1,139 @@
+# cobra-kai/src/main/ansible/infra.yml
+---
+- name: Creating Web App, App Insight, CosmosDB and wiring
+  hosts: localhost
+  gather_facts: no
+  vars:
+    telemetry_user: "AA4648S"
+
+  pre_tasks:
+    - name: Initialize AZF
+      ansible.builtin.include_role:
+        name: azurefactory.security.init_azure_factory_201
+
+  tasks:
+    #################################################################
+    # Monitoring – Application Insights
+    #################################################################
+    - name: Create 'docsit' azure application insights 201
+      ansible.builtin.include_role:
+        name: azurefactory.management.create_azure_application_insights_201
+      vars:
+        cloud_element: "{{ azf.resources.app_insight_1 }}"
+        ansible_facts_output_var: "app_insights_out"
+
+    #################################################################
+    # Web Apps (create)
+    #################################################################
+    - name: Create 'webapp' azure webapp
+      ansible.builtin.include_role:
+        name: azurefactory.web.create_azure_web_app_202
+      vars:
+        cloud_element: "{{ azf.resources.webapp_1 }}"
+        ansible_facts_output_var: "webapp_1_out"
+
+    - name: Create 'webapp2' azure webapp
+      ansible.builtin.include_role:
+        name: azurefactory.web.create_azure_web_app_202
+      vars:
+        cloud_element: "{{ azf.resources.webapp_2 }}"
+        ansible_facts_output_var: "webapp_2_out"
+
+    #################################################################
+    # Cosmos DB (create + get connection info)
+    #################################################################
+    - name: Deploy the DocumentDB Database Account
+      ansible.builtin.include_role:
+        name: azurefactory.databases.create_cosmos_db_203
+      vars:
+        cloud_element: "{{ azf.resources.cosmosdb_1 }}"
+        ansible_facts_output_var: "cosmosdb_1_out"
+
+    - name: Alias Cosmos DB fact to 'db'
+      ansible.builtin.set_fact:
+        db: "{{ cosmosdb_1_out }}"
+
+    - name: Get Cosmos DB endpoint (documentEndpoint)
+      azurefactory.core.run_az_001:
+        cmd: >
+          cosmosdb show
+          --name "{{ db.json.name }}"
+          --resource-group "{{ db.json.resourceGroup }}"
+          --query "documentEndpoint"
+          --output json
+      register: COSMOSDB_URL
+
+    - name: Get Cosmos primary key
+      azurefactory.core.run_az_001:
+        cmd: >
+          cosmosdb keys list
+          --name "{{ db.json.name }}"
+          --resource-group "{{ db.json.resourceGroup }}"
+          --type keys
+          --query "primaryMasterKey"
+          --output json
+      register: COSMOSDB_PRIMARY_KEY
+
+    #################################################################
+    # UAMI (create, get principalId, assign to webapp)
+    #################################################################
+    - name: Create UAMI for WebApp1
+      ansible.builtin.include_role:
+        name: azurefactory.security.create_aad_uami_201
+      vars:
+        cloud_element: "{{ azf.resources.uami_webapp_1 }}"
+        ansible_facts_output_var: "uami_webapp_1_out"
+
+    - name: Set UAMI principalId fact (safe)
+      ansible.builtin.set_fact:
+        uami_principal_id: "{{ (uami_webapp_1_out | default({})).principalId | default(omit) }}"
+
+    - name: (Fallback) Get UAMI principalId via az CLI when missing
+      azurefactory.core.run_az_001:
+        cmd: >
+          identity show
+          --name {{ azf.resources.uami_webapp_1.name }}
+          --resource-group {{ azf.resources.uami_webapp_1.group_name }}
+          --query "principalId"
+          --output tsv
+      register: uami_pid_query
+      when: uami_principal_id is not defined
+
+    - name: Finalize UAMI principalId
+      ansible.builtin.set_fact:
+        uami_principal_id: "{{ uami_principal_id | default(uami_pid_query.stdout) }}"
+
+    - name: Assign UAMI to WebApp1
+      azurefactory.core.run_az_001:
+        cmd: >
+          webapp identity assign
+          --identities {{ uami_principal_id }}
+          --name {{ azf.resources.webapp_1.name }}
+          --resource-group {{ azf.resources.webapp_1.group_name }}
+          --output json
+      register: assign_uami_webapp_1_out
+
+    #################################################################
+    # App settings (write Cosmos connection into WebApp AFTER we have them)
+    #################################################################
+    - name: Configure App Settings for Web App
+      azurefactory.core.run_az_001:
+        cmd: >
+          webapp config appsettings set
+          --resource-group {{ azf.resources.webapp_1.group_name }}
+          --name {{ azf.resources.webapp_1.name }}
+          --settings
+          COSMOS_URI={{ COSMOSDB_URL.json }}
+          COSMOS_KEY={{ COSMOSDB_PRIMARY_KEY.json }}
+          --output json
+      register: set_appsettings_out
+
+    #################################################################
+    # (Optional) quick debug
+    #################################################################
+    - name: Debug essentials
+      ansible.builtin.debug:
+        msg:
+          - "UAMI principalId: {{ uami_principal_id }}"
+          - "Cosmos endpoint: {{ COSMOSDB_URL.json }}"
+          - "App settings updated rc: {{ set_appsettings_out.rc | default('n/a') }}"
